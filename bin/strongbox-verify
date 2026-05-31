@@ -1,0 +1,94 @@
+#!/bin/bash
+# bin/strongbox-verify — Audit log verifier
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../lib/crypto.sh"
+
+AUDIT_LOG="${AUDIT_LOG_PATH:-/tmp/strongbox/audit.log}"
+AUDIT_SECRET="${AUDIT_HMAC_SECRET:-}"
+
+verify_audit_log() {
+  if [[ -z "$AUDIT_SECRET" ]]; then
+    echo "ERROR: AUDIT_HMAC_SECRET not set" >&2
+    exit 1
+  fi
+
+  if [[ ! -f "$AUDIT_LOG" ]]; then
+    echo "ERROR: Log not found: $AUDIT_LOG" >&2
+    exit 1
+  fi
+
+  local total
+  total=$(wc -l < "$AUDIT_LOG" | tr -d ' ')
+  echo "Verifying $total audit entries..."
+  echo "────────────────────────────────────"
+
+  local prev_hmac="0000000000000000000000000000000000000000000000000000000000000000"
+  local index=0
+  local failed=0
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+
+    # Extract stored hmac — last field in the JSON
+    local stored_hmac
+    stored_hmac=$(echo "$line" | \
+      grep -o '"hmac":"[^"]*"' | \
+      tail -1 | \
+      sed 's/"hmac":"//;s/"//')
+
+    # Extract prev_hash
+    local entry_prev_hash
+    entry_prev_hash=$(echo "$line" | \
+      grep -o '"prev_hash":"[^"]*"' | \
+      sed 's/"prev_hash":"//;s/"//')
+
+    # Remove ONLY the hmac field from end of JSON
+    # Entry format: {...,"hmac":"value"}
+    # We need to remove ,"hmac":"value"} and add back }
+    local entry_body
+    entry_body=$(echo "$line" | \
+      sed 's/,"hmac":"[^"]*"}/}/')
+
+    # Recompute HMAC on the body
+    local computed_hmac
+    computed_hmac=$(echo -n "$entry_body" | \
+      openssl dgst -sha256 \
+      -hmac "$AUDIT_SECRET" | \
+      awk '{print $2}')
+
+    # Check 1: HMAC matches
+    if [[ "$stored_hmac" != "$computed_hmac" ]]; then
+      echo "❌ TAMPERED Entry #$index — HMAC mismatch"
+      echo "   Stored:   $stored_hmac"
+      echo "   Computed: $computed_hmac"
+      ((failed++))
+    fi
+
+    # Check 2: Chain intact (skip genesis at index 0)
+    if [[ $index -gt 0 ]]; then
+      if [[ "$entry_prev_hash" != "$prev_hmac" ]]; then
+        echo "❌ CHAIN BROKEN at Entry #$index"
+        echo "   Expected: $prev_hmac"
+        echo "   Found:    $entry_prev_hash"
+        ((failed++))
+      fi
+    fi
+
+    prev_hmac="$stored_hmac"
+    ((index++))
+
+  done < "$AUDIT_LOG"
+
+  echo "────────────────────────────────────"
+
+  if [[ $failed -eq 0 ]]; then
+    echo "✅ Audit log OK — $index entries verified"
+    exit 0
+  else
+    echo "❌ FAILED — $failed corrupted entries found"
+    exit 1
+  fi
+}
+
+verify_audit_log
