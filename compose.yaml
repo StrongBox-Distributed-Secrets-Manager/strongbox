@@ -1,0 +1,56 @@
+services:
+  node1:
+    build: .
+    command: ["serve", "8080"]
+    environment:
+      STRONGBOX_NODE_ID: node1
+      STRONGBOX_LEADER_ID: node1
+      STRONGBOX_DATA_DIR: /dev/shm/strongbox-node1
+      STRONGBOX_AUDIT_KEY: ${STRONGBOX_AUDIT_KEY:-dev-audit-key-change-me}
+      STRONGBOX_DEFAULT_TTL: ${STRONGBOX_DEFAULT_TTL:-30}
+      STRONGBOX_MAX_TTL: ${STRONGBOX_MAX_TTL:-300}
+      POSTGRES_DSN: postgres://strongbox_admin:${POSTGRES_ADMIN_PASSWORD:-strongbox_admin}@postgres:5432/${POSTGRES_DB:-postgres}
+      POSTGRES_ADMIN_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:-strongbox_admin}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+    ports: ["8081:8080"]
+  node2:
+    build: .
+    command: ["serve", "8080"]
+    environment:
+      STRONGBOX_NODE_ID: node2
+      STRONGBOX_LEADER_ID: node1
+      STRONGBOX_DATA_DIR: /dev/shm/strongbox-node2
+      STRONGBOX_AUDIT_KEY: ${STRONGBOX_AUDIT_KEY:-dev-audit-key-change-me}
+      STRONGBOX_DEFAULT_TTL: ${STRONGBOX_DEFAULT_TTL:-30}
+      STRONGBOX_MAX_TTL: ${STRONGBOX_MAX_TTL:-300}
+      POSTGRES_DSN: postgres://strongbox_admin:${POSTGRES_ADMIN_PASSWORD:-strongbox_admin}@postgres:5432/${POSTGRES_DB:-postgres}
+      POSTGRES_ADMIN_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:-strongbox_admin}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+    ports: ["8082:8080"]
+  node3:
+    build: .
+    command: ["serve", "8080"]
+    environment:
+      STRONGBOX_NODE_ID: node3
+      STRONGBOX_LEADER_ID: node1
+      STRONGBOX_DATA_DIR: /dev/shm/strongbox-node3
+      STRONGBOX_AUDIT_KEY: ${STRONGBOX_AUDIT_KEY:-dev-audit-key-change-me}
+      STRONGBOX_DEFAULT_TTL: ${STRONGBOX_DEFAULT_TTL:-30}
+      STRONGBOX_MAX_TTL: ${STRONGBOX_MAX_TTL:-300}
+      POSTGRES_DSN: postgres://strongbox_admin:${POSTGRES_ADMIN_PASSWORD:-strongbox_admin}@postgres:5432/${POSTGRES_DB:-postgres}
+      POSTGRES_ADMIN_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:-strongbox_admin}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+    ports: ["8083:8080"]
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:-strongbox_admin}
+      POSTGRES_USER: strongbox_admin
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+    ports: ["5432:5432"]
+  nginx:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports: ["8080:80"]
+    depends_on: [node1, node2, node3]
