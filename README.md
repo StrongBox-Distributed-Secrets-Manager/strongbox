@@ -52,10 +52,10 @@ Set this before final submission: `https://yaat-strongbox.duckdns.org` or your T
 
 ## Ubuntu 24.04 VPS Deployment
 
-Copy the archive to the VPS, unpack it, install Docker, start the stack, then run the smoke test:
+Clone the repo to the VPS, unpack it, install Docker, start the stack, then run the smoke test:
 
 ```bash
-tar -xzf strongbox-test.tar.gz
+git clone https://github.com/StrongBox-Distributed-Secrets-Manager/strongbox.git strongbox-test
 cd strongbox-test
 sudo bash scripts/bootstrap-ubuntu-24.04.sh
 bash scripts/start-vps.sh
@@ -102,4 +102,4 @@ Every encryption operation generates a fresh random IV with OpenSSL. The encrypt
 
 ## GitHub
 
-Set before submission: `https://github.com/AirFluke/real-strongbox`
+Set before submission: `https://github.com/StrongBox-Distributed-Secrets-Manager/strongbox`
