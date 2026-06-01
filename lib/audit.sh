@@ -1,81 +1,72 @@
-#!/bin/bash
-# lib/audit.sh — Tamper-evident audit log (no jq required)
+#!/usr/bin/env bash
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/crypto.sh"
+# shellcheck source=storage.sh
+. "$SCRIPT_DIR/storage.sh"
 
-AUDIT_LOG="${AUDIT_LOG_PATH:-/tmp/strongbox/audit.log}"
-AUDIT_SECRET="${AUDIT_HMAC_SECRET:-changeme}"
-LAST_HASH="0000000000000000000000000000000000000000000000000000000000000000"
+: "${STRONGBOX_AUDIT_KEY:=dev-audit-key-change-me}"
 
-# Initialize audit log
-audit_init() {
-  mkdir -p "$(dirname "$AUDIT_LOG")"
+audit_log_file() {
+  storage_init
+  printf '%s/audit/audit.log' "$STRONGBOX_DATA_DIR"
+}
 
-  if [[ -f "$AUDIT_LOG" ]] && \
-     [[ -s "$AUDIT_LOG" ]]; then
-    # Load last hash
-    LAST_HASH=$(tail -1 "$AUDIT_LOG" | \
-      grep -o '"hmac":"[^"]*"' | \
-      sed 's/"hmac":"//;s/"//')
-    local count
-    count=$(wc -l < "$AUDIT_LOG")
-    echo "Audit log loaded: $count entries"
+audit_hmac() {
+  printf '%s' "$1" | openssl dgst -sha256 -hmac "$STRONGBOX_AUDIT_KEY" -binary | base64 | tr -d '\n'
+}
+
+audit_append() {
+  local token="${1:-anonymous}" op="${2:-unknown}" path="${3:-/}" status="${4:-ok}" log prev idx ts body mac
+  log="$(audit_log_file)"
+  if [[ -s "$log" ]]; then
+    prev="$(tail -n 1 "$log" | awk -F'|' '{print $8}')"
+    idx="$(($(tail -n 1 "$log" | awk -F'|' '{print $1}') + 1))"
   else
-    # Write genesis entry
-    _write_entry "GENESIS" "system" "/sys/init"
-    echo "Audit log created: $AUDIT_LOG"
+    prev="GENESIS"
+    idx=0
   fi
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  body="${idx}|${ts}|${token}|${op}|${path}|${status}|${prev}"
+  mac="$(audit_hmac "$body")"
+  printf '%s|%s\n' "$body" "$mac" >>"$log"
 }
 
-# Internal write function
-_write_entry() {
-  local operation="$1"
-  local token_id="$2"
-  local path="$3"
-
-  local ts
-  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-
-  local index=0
-  if [[ -f "$AUDIT_LOG" ]]; then
-    index=$(wc -l < "$AUDIT_LOG" | tr -d ' ')
-  fi
-
-  # Build entry as JSON string manually (no jq)
-  local entry="{\"index\":${index},\"ts\":\"${ts}\",\"op\":\"${operation}\",\"path\":\"${path}\",\"token_id\":\"${token_id}\",\"prev_hash\":\"${LAST_HASH}\"}"
-
-  # Sign entry
-  local hmac
-  hmac=$(hmac_sign "$entry" "$AUDIT_SECRET")
-
-  # Full entry with hmac
-  local full_entry="{\"index\":${index},\"ts\":\"${ts}\",\"op\":\"${operation}\",\"path\":\"${path}\",\"token_id\":\"${token_id}\",\"prev_hash\":\"${LAST_HASH}\",\"hmac\":\"${hmac}\"}"
-
-  echo "$full_entry" >> "$AUDIT_LOG"
-  LAST_HASH="$hmac"
+audit_verify() {
+  local log="${1:-$(audit_log_file)}" prev="GENESIS" expected idx=0 line body mac entry_idx
+  [[ -f "$log" ]] || { echo "audit log not found: $log" >&2; return 2; }
+  while IFS= read -r line; do
+    body="${line%|*}"
+    mac="${line##*|}"
+    entry_idx="$(printf '%s' "$body" | awk -F'|' '{print $1}')"
+    expected="$(audit_hmac "$body")"
+    if [[ "$entry_idx" != "$idx" || "$mac" != "$expected" ]]; then
+      echo "corrupt audit entry index ${idx}" >&2
+      return 1
+    fi
+    if [[ "$(printf '%s' "$body" | awk -F'|' '{print $7}')" != "$prev" ]]; then
+      echo "corrupt audit entry index ${idx}: previous hash mismatch" >&2
+      return 1
+    fi
+    prev="$mac"
+    idx=$((idx + 1))
+  done <"$log"
+  echo "audit ok: ${idx} entries"
 }
 
-# Public: append audit entry
-# Usage: audit_log "token_id" "operation" "path"
-audit_log() {
-  local token_id="${1:-system}"
-  local operation="${2:-UNKNOWN}"
-  local path="${3:-/}"
-  _write_entry "$operation" "$token_id" "$path"
-}
-
-# Read audit log
-audit_read() {
-  local filter="${1:-}"
-  if [[ ! -f "$AUDIT_LOG" ]]; then
-    echo "[]"
-    return
-  fi
-
-  if [[ -n "$filter" ]]; then
-    grep "\"token_id\":\"$filter\"" "$AUDIT_LOG"
-  else
-    cat "$AUDIT_LOG"
-  fi
+audit_query_json() {
+  local token_filter="${1:-}"
+  local log
+  log="$(audit_log_file)"
+  printf '['
+  [[ -f "$log" ]] || { printf ']'; return 0; }
+  awk -F'|' -v token="$token_filter" '
+    BEGIN { first=1 }
+    token == "" || $3 == token {
+      if (!first) printf ",";
+      first=0;
+      printf "{\"ts\":\"%s\",\"token\":\"%s\",\"op\":\"%s\",\"path\":\"%s\",\"status\":\"%s\"}", $2, $3, $4, $5, $6
+    }
+  ' "$log"
+  printf ']'
 }
