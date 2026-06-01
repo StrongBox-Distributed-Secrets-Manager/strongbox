@@ -51,3 +51,9 @@ decrypt_value() {
   key_hex="$(kdf_hex32 "$dek")"
   printf '%s' "$cipher" | openssl enc -d -aes-256-cbc -K "$key_hex" -iv "$iv" -base64 -A
 }
+
+# Generate a fresh 32-byte Data Encryption Key (DEK) from CSPRNG
+# Usage: generate_dek -> hex string
+generate_dek() {
+  openssl rand -hex 32
+}
