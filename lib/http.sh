@@ -1,319 +1,172 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
-# HTTP Router for StrongBox
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/storage.sh"
+. "$SCRIPT_DIR/crypto.sh"
+. "$SCRIPT_DIR/auth.sh"
+. "$SCRIPT_DIR/lease.sh"
+. "$SCRIPT_DIR/dynamic.sh"
+. "$SCRIPT_DIR/consensus.sh"
+. "$SCRIPT_DIR/audit.sh"
 
-# Send command to the daemon over IPC named pipe
-send_ipc_cmd() {
-    local cmd="$1"
-    shift
-    local ipc_payload="$$ $cmd"
-    for arg in "$@"; do
-        local arg_b64
-        arg_b64=$(echo -n "$arg" | base64 -w0)
-        ipc_payload+=" $arg_b64"
-    done
+: "${STRONGBOX_THRESHOLD:=2}"
+: "${STRONGBOX_SHARES:=3}"
 
-    local reply_fifo="/dev/shm/reply_$$"
-    mkdir -p /dev/shm
-    mkfifo "$reply_fifo"
-    
-    # Send payload to daemon
-    if ! echo "$ipc_payload" > /dev/shm/strongbox_ipc.fifo 2>/dev/null; then
-        echo '{"error": "daemon offline"}' | base64 -w0
-        rm -f "$reply_fifo"
-        return 1
-    fi
-    
-    local resp=""
-    # 5 seconds timeout for daemon response
-    if read -t 5 -r resp < "$reply_fifo"; then
-        echo -n "$resp"
-    else
-        echo '{"error": "daemon timeout"}' | base64 -w0
-    fi
-    rm -f "$reply_fifo"
+json_field() {
+  local json="$1" key="$2"
+  printf '%s' "$json" | sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p"
 }
 
-# Parse and route HTTP request
-handle_http_request() {
-    # Read request line
-    read -r req_line
-    req_line="${req_line%$'\r'}"
-    if [[ -z "$req_line" ]]; then
-        return 1
-    fi
-
-    local METHOD PATH HTTP_VERSION
-    read -r METHOD PATH HTTP_VERSION <<< "$req_line"
-
-    # Extract query parameters
-    local QUERY_STRING=""
-    if [[ "$PATH" == *"?"* ]]; then
-        QUERY_STRING="${PATH#*\?}"
-        PATH="${PATH%%\?*}"
-    fi
-
-    # Read headers
-    local CONTENT_LENGTH=0
-    local AUTH_HEADER=""
-    while read -r header; do
-        header="${header%$'\r'}"
-        if [[ -z "$header" ]]; then
-            break
-        fi
-        if [[ "$header" =~ ^[Cc]ontent-[Ll]ength:\ *(.*)$ ]]; then
-            CONTENT_LENGTH="${BASH_REMATCH[1]}"
-        elif [[ "$header" =~ ^[Aa]uthorization:\ *(.*)$ ]]; then
-            AUTH_HEADER="${BASH_REMATCH[1]}"
-        fi
-    done
-
-    # Read body if any
-    local REQ_BODY=""
-    if (( CONTENT_LENGTH > 0 )); then
-        read -N "$CONTENT_LENGTH" -r REQ_BODY
-    fi
-
-    # Extract Bearer Token
-    local TOKEN=""
-    if [[ "$AUTH_HEADER" =~ ^[Bb]earer\ +(.*)$ ]]; then
-        TOKEN="${BASH_REMATCH[1]}"
-    fi
-
-    # IPC request execution
-    local ipc_resp_b64
-    local http_status=200
-    local http_body=""
-
-    # ROUTING
-    # 1. Sys Consensus internal endpoints (must not require token, but term checks)
-    if [[ "$PATH" == "/v1/sys/consensus/request_vote" && "$METHOD" == "POST" ]]; then
-        local term
-        term=$(echo "$REQ_BODY" | jq -r '.term // 0')
-        local candidate_id
-        candidate_id=$(echo "$REQ_BODY" | jq -r '.candidate_id // ""')
-        ipc_resp_b64=$(send_ipc_cmd "CON_REQUEST_VOTE" "$term" "$candidate_id")
-        http_status=200
-
-    elif [[ "$PATH" == "/v1/sys/consensus/heartbeat" && "$METHOD" == "POST" ]]; then
-        local term
-        term=$(echo "$REQ_BODY" | jq -r '.term // 0')
-        local leader_id
-        leader_id=$(echo "$REQ_BODY" | jq -r '.leader_id // ""')
-        ipc_resp_b64=$(send_ipc_cmd "CON_HEARTBEAT" "$term" "$leader_id")
-        http_status=200
-
-    elif [[ "$PATH" == "/v1/sys/consensus/replicate" && "$METHOD" == "POST" ]]; then
-        local op
-        op=$(echo "$REQ_BODY" | jq -r '.op // ""')
-        local key
-        key=$(echo "$REQ_BODY" | jq -r '.key // ""')
-        local val
-        val=$(echo "$REQ_BODY" | jq -r '.value // ""')
-        local term
-        term=$(echo "$REQ_BODY" | jq -r '.term // 0')
-        local leader_id
-        leader_id=$(echo "$REQ_BODY" | jq -r '.leader_id // ""')
-        ipc_resp_b64=$(send_ipc_cmd "CON_REPLICATE" "$op" "$key" "$val" "$term" "$leader_id")
-        http_status=200
-
-    # 2. Sys Standard Endpoints
-    elif [[ "$PATH" == "/v1/sys/init" && "$METHOD" == "POST" ]]; then
-        # Parse K and N from body if provided, otherwise default to 2-of-3
-        local k
-        k=$(echo "$REQ_BODY" | jq -r '.k // 2')
-        local n
-        n=$(echo "$REQ_BODY" | jq -r '.n // 3')
-        ipc_resp_b64=$(send_ipc_cmd "INIT" "$k" "$n")
-        http_status=200
-
-    elif [[ "$PATH" == "/v1/sys/unseal" && "$METHOD" == "POST" ]]; then
-        local share
-        share=$(echo "$REQ_BODY" | jq -r '.share // ""')
-        ipc_resp_b64=$(send_ipc_cmd "UNSEAL" "$share")
-        http_status=200
-
-    elif [[ "$PATH" == "/v1/sys/seal" && "$METHOD" == "POST" ]]; then
-        ipc_resp_b64=$(send_ipc_cmd "SEAL" "$TOKEN")
-        http_status=204
-
-    elif [[ "$PATH" == "/v1/sys/health" && "$METHOD" == "GET" ]]; then
-        ipc_resp_b64=$(send_ipc_cmd "HEALTH")
-        http_status=200
-
-    # 3. Auth Endpoints
-    elif [[ "$PATH" == "/v1/auth/login" && "$METHOD" == "POST" ]]; then
-        local username
-        username=$(echo "$REQ_BODY" | jq -r '.username // ""')
-        local password
-        password=$(echo "$REQ_BODY" | jq -r '.password // ""')
-        ipc_resp_b64=$(send_ipc_cmd "LOGIN" "$username" "$password")
-        http_status=200
-
-    elif [[ "$PATH" == "/v1/auth/revoke" && "$METHOD" == "POST" ]]; then
-        local target_token
-        target_token=$(echo "$REQ_BODY" | jq -r '.token // ""')
-        ipc_resp_b64=$(send_ipc_cmd "REVOKE_TOKEN" "$target_token" "$TOKEN")
-        http_status=204
-
-    elif [[ "$PATH" == "/v1/auth/self" && "$METHOD" == "GET" ]]; then
-        ipc_resp_b64=$(send_ipc_cmd "GET_TOKEN_SELF" "$TOKEN")
-        http_status=200
-
-    # 4. Policy Endpoints
-    elif [[ "$PATH" =~ ^/v1/policies/(.+)$ ]]; then
-        local name="${BASH_REMATCH[1]}"
-        if [[ "$METHOD" == "PUT" ]]; then
-            ipc_resp_b64=$(send_ipc_cmd "PUT_POLICY" "$name" "$REQ_BODY" "$TOKEN")
-            http_status=201
-        elif [[ "$METHOD" == "GET" ]]; then
-            ipc_resp_b64=$(send_ipc_cmd "GET_POLICY" "$name" "$TOKEN")
-            http_status=200
-        else
-            http_status=405
-            ipc_resp_b64=$(echo '{"error": "method not allowed"}' | base64 -w0)
-        fi
-
-    # 5. Secrets Endpoints
-    elif [[ "$PATH" =~ ^/v1/secrets/(.+)$ ]]; then
-        local secret_path="${BASH_REMATCH[1]}"
-        if [[ "$METHOD" == "PUT" ]]; then
-            ipc_resp_b64=$(send_ipc_cmd "PUT_SECRET" "$secret_path" "$REQ_BODY" "$TOKEN")
-            http_status=201
-        elif [[ "$METHOD" == "GET" ]]; then
-            # Parse version query param
-            local version=""
-            if [[ "$QUERY_STRING" =~ version=([0-9]+) ]]; then
-                version="${BASH_REMATCH[1]}"
-            fi
-            ipc_resp_b64=$(send_ipc_cmd "GET_SECRET" "$secret_path" "$version" "$TOKEN")
-            http_status=200
-        elif [[ "$METHOD" == "DELETE" ]]; then
-            ipc_resp_b64=$(send_ipc_cmd "DELETE_SECRET" "$secret_path" "$TOKEN")
-            http_status=204
-        else
-            http_status=405
-            ipc_resp_b64=$(echo '{"error": "method not allowed"}' | base64 -w0)
-        fi
-
-    # 6. Dynamic Secrets Endpoints
-    elif [[ "$PATH" =~ ^/v1/dynamic-postgres/(.+)$ ]]; then
-        local role="${BASH_REMATCH[1]}"
-        if [[ "$METHOD" == "GET" ]]; then
-            ipc_resp_b64=$(send_ipc_cmd "GET_DYNAMIC" "$role" "$TOKEN")
-            http_status=200
-        else
-            http_status=405
-            ipc_resp_b64=$(echo '{"error": "method not allowed"}' | base64 -w0)
-        fi
-
-    # 7. Lease Endpoints
-    elif [[ "$PATH" =~ ^/v1/leases/(.+)/renew$ ]]; then
-        local lease_id="${BASH_REMATCH[1]}"
-        if [[ "$METHOD" == "POST" ]]; then
-            # Get increment TTL from body if provided, else default 300
-            local inc
-            inc=$(echo "$REQ_BODY" | jq -r '.increment // 300')
-            ipc_resp_b64=$(send_ipc_cmd "RENEW_LEASE" "$lease_id" "$inc" "$TOKEN")
-            http_status=200
-        else
-            http_status=405
-            ipc_resp_b64=$(echo '{"error": "method not allowed"}' | base64 -w0)
-        fi
-
-    elif [[ "$PATH" =~ ^/v1/leases/(.+)/revoke$ ]]; then
-        local lease_id="${BASH_REMATCH[1]}"
-        if [[ "$METHOD" == "POST" ]]; then
-            ipc_resp_b64=$(send_ipc_cmd "REVOKE_LEASE" "$lease_id" "$TOKEN")
-            http_status=204
-        else
-            http_status=405
-            ipc_resp_b64=$(echo '{"error": "method not allowed"}' | base64 -w0)
-        fi
-
-    # 8. Audit Endpoints
-    elif [[ "$PATH" == "/v1/audit" && "$METHOD" == "GET" ]]; then
-        local filter_token=""
-        if [[ "$QUERY_STRING" =~ token=([^&]+) ]]; then
-            filter_token="${BASH_REMATCH[1]}"
-        fi
-        ipc_resp_b64=$(send_ipc_cmd "GET_AUDIT" "$filter_token" "$TOKEN")
-        http_status=200
-
-    else
-        http_status=404
-        ipc_resp_b64=$(echo '{"error": "endpoint not found"}' | base64 -w0)
-    fi
-
-    # Decode response
-    http_body=$(echo -n "$ipc_resp_b64" | base64 -d)
-
-    # If response has an error field, map to correct HTTP status codes
-    if [[ -n "$http_body" ]]; then
-        local err
-        err=$(echo "$http_body" | jq -r '.error // empty')
-        if [[ -n "$err" ]]; then
-            case "$err" in
-                "vault is sealed"|"daemon offline") http_status=503 ;;
-                "not leader"|"not_leader")
-                    http_status=307
-                    # Extract leader address
-                    local leader_url
-                    leader_url=$(echo "$http_body" | jq -r '.leader // empty')
-                    if [[ -n "$leader_url" ]]; then
-                        export REDIRECT_LOCATION="${leader_url}${PATH}"
-                        if [[ -n "$QUERY_STRING" ]]; then
-                            REDIRECT_LOCATION+="?${QUERY_STRING}"
-                        fi
-                    fi
-                    ;;
-                "unauthorized"|"token invalid"|"token expired") http_status=401 ;;
-                "forbidden"|"permission denied") http_status=403 ;;
-                "not found"|"secret not found"|"lease not found") http_status=404 ;;
-                "quorum lost"|"consensus write replication failed") http_status=503 ;;
-                *) http_status=400 ;;
-            esac
-        fi
-    fi
-
-    # Send HTTP response
-    http_respond "$http_status" "$http_body"
+json_data_object() {
+  printf '%s' "$1" | sed -n 's/.*"data"[[:space:]]*:[[:space:]]*//p' | sed 's/}}$/}/'
 }
 
-# HTTP status sender
-http_respond() {
-    local status="$1"
-    local body="$2"
-    local status_text="OK"
-    case "$status" in
-        200) status_text="OK" ;;
-        201) status_text="Created" ;;
-        204) status_text="No Content" ;;
-        307) status_text="Temporary Redirect" ;;
-        400) status_text="Bad Request" ;;
-        401) status_text="Unauthorized" ;;
-        403) status_text="Forbidden" ;;
-        404) status_text="Not Found" ;;
-        405) status_text="Method Not Allowed" ;;
-        500) status_text="Internal Server Error" ;;
-        503) status_text="Service Unavailable" ;;
-    esac
+sealed_file() { printf '%s/seal/sealed' "$STRONGBOX_DATA_DIR"; }
+initialized_file() { printf '%s/seal/initialized' "$STRONGBOX_DATA_DIR"; }
+kek_file() { printf '%s/seal/kek' "$STRONGBOX_DATA_DIR"; }
+shares_file() { printf '%s/seal/submitted_shares' "$STRONGBOX_DATA_DIR"; }
+root_token_file() { printf '%s/seal/root_token' "$STRONGBOX_DATA_DIR"; }
 
-    local len=0
-    if [[ -n "$body" && "$status" != "204" ]]; then
-        len=$(echo -ne "$body" | wc -c)
-    fi
-
-    echo -ne "HTTP/1.1 $status $status_text\r\n"
-    echo -ne "Content-Type: application/json\r\n"
-    echo -ne "Content-Length: $len\r\n"
-    if [[ "$status" == "307" && -n "$REDIRECT_LOCATION" ]]; then
-        echo -ne "Location: $REDIRECT_LOCATION\r\n"
-    fi
-    echo -ne "Connection: close\r\n\r\n"
-    if [[ -n "$body" && "$status" != "204" ]]; then
-        echo -ne "$body"
-    fi
+seal_bootstrap() {
+  storage_init
+  if [[ ! -f "$(initialized_file)" ]]; then
+    touch "$(sealed_file)"
+  fi
 }
 
-handle_http_request
+is_sealed() {
+  seal_bootstrap
+  [[ -f "$(sealed_file)" ]]
+}
+
+require_unsealed() {
+  if is_sealed; then
+    printf '{"error":"sealed"}'
+    return 1
+  fi
+}
+
+current_kek() {
+  cat "$(kek_file)"
+}
+
+sys_init() {
+  seal_bootstrap
+  if [[ -f "$(initialized_file)" ]]; then
+    printf '{"error":"already initialized"}'
+    return 1
+  fi
+  local master_hex kek root_token shares_json
+  master_hex="$(openssl rand -hex 32)"
+  kek="$(openssl rand -base64 32 | tr -d '\n')"
+  "$SCRIPT_DIR/shamir.py" split "$master_hex" "$STRONGBOX_THRESHOLD" "$STRONGBOX_SHARES" >"$STRONGBOX_DATA_DIR/seal/shares.tmp"
+  printf '%s' "$kek" >"$(kek_file)"
+  : >"$(shares_file)"
+  touch "$(sealed_file)"
+  touch "$(initialized_file)"
+  policy_put root '*|read,write,delete'
+  root_token="$(token_create root 86400)"
+  printf '%s' "$root_token" >"$(root_token_file)"
+  shares_json="$(awk 'BEGIN{printf "["} {if(NR>1)printf ","; printf "\"%s\"", $0} END{printf "]"}' "$STRONGBOX_DATA_DIR/seal/shares.tmp")"
+  rm -f "$STRONGBOX_DATA_DIR/seal/shares.tmp"
+  master_hex="$(printf '%064d' 0)"
+  audit_append root init /v1/sys/init 201
+  printf '{"shares":%s,"root_token":"%s"}' "$shares_json" "$root_token"
+}
+
+sys_unseal() {
+  local body="$1" share progress recovered
+  seal_bootstrap
+  [[ -f "$(initialized_file)" ]] || { printf '{"error":"not initialized"}'; return 1; }
+  share="$(json_field "$body" share)"
+  [[ -n "$share" ]] || { printf '{"error":"missing share"}'; return 1; }
+  grep -qxF "$share" "$(shares_file)" 2>/dev/null || printf '%s\n' "$share" >>"$(shares_file)"
+  progress="$(wc -l <"$(shares_file)" | tr -d ' ')"
+  if (( progress >= STRONGBOX_THRESHOLD )); then
+    recovered="$("$SCRIPT_DIR/shamir.py" recover $(head -n "$STRONGBOX_THRESHOLD" "$(shares_file)"))"
+    : >"$(shares_file)"
+    rm -f "$(sealed_file)"
+    recovered="$(printf '%064d' 0)"
+    audit_append anonymous unseal /v1/sys/unseal 200
+    printf '{"sealed":false,"progress":"%s/%s"}' "$STRONGBOX_THRESHOLD" "$STRONGBOX_THRESHOLD"
+  else
+    audit_append anonymous unseal /v1/sys/unseal 202
+    printf '{"sealed":true,"progress":"%s/%s"}' "$progress" "$STRONGBOX_THRESHOLD"
+  fi
+}
+
+sys_seal() {
+  local token="$1"
+  auth_check "$token" /v1/sys/seal write || { printf '{"error":"forbidden"}'; return 1; }
+  touch "$(sealed_file)"
+  rm -f "$(kek_file)"
+  audit_append "$(token_hash "$token")" seal /v1/sys/seal 204
+}
+
+secret_latest_version() {
+  local path="$1" p
+  p="$(storage_path secrets "$path")"
+  [[ -f "$p" ]] || { echo 0; return; }
+  awk -F'|' 'END{print $1}' "$p"
+}
+
+secret_write() {
+  local token="$1" path="$2" body="$3" data version blob
+  require_unsealed || return 1
+  cluster_require_leader >/dev/null || return 1
+  auth_check "$token" "secret/${path}" write || { printf '{"error":"forbidden"}'; return 1; }
+  data="$(json_data_object "$body")"
+  [[ -n "$data" ]] || data="$body"
+  version="$(($(secret_latest_version "$path") + 1))"
+  blob="$(encrypt_value "$data" "$(current_kek)")"
+  printf '%s|%s\n' "$version" "$blob" >>"$(storage_path secrets "$path")"
+  audit_append "$(token_hash "$token")" write "secret/${path}" 201
+  printf '{"version":%s}' "$version"
+}
+
+secret_read() {
+  local token="$1" path="$2" version="${3:-}" rec blob lease_id
+  require_unsealed || return 1
+  auth_check "$token" "secret/${path}" read || { printf '{"error":"forbidden"}'; return 1; }
+  if [[ -n "$version" ]]; then
+    rec="$(awk -F'|' -v v="$version" '$1==v {print; exit}' "$(storage_path secrets "$path")")"
+  else
+    rec="$(tail -n 1 "$(storage_path secrets "$path")")"
+  fi
+  [[ -n "$rec" ]] || { printf '{"error":"not found"}'; return 1; }
+  version="${rec%%|*}"
+  blob="${rec#*|}"
+  lease_id="$(lease_create "secret/${path}")"
+  audit_append "$(token_hash "$token")" read "secret/${path}" 200
+  printf '{"data":%s,"version":%s,"lease":%s}' "$(decrypt_value "$blob" "$(current_kek)")" "$version" "$(lease_json "$lease_id")"
+}
+
+route_request() {
+  local method="$1" raw_path="$2" body="${3:-}" auth="${4:-}" token path query version role name lease_id
+  seal_bootstrap
+  cluster_bootstrap
+  token="${auth#Bearer }"
+  path="${raw_path%%\?*}"
+  query=""
+  [[ "$raw_path" == *\?* ]] && query="${raw_path#*\?}"
+  case "${method} ${path}" in
+    "POST /v1/sys/init") sys_init ;;
+    "POST /v1/sys/unseal") sys_unseal "$body" ;;
+    "POST /v1/sys/seal") sys_seal "$token" ;;
+    "GET /v1/sys/health") printf '{"sealed":%s,"leader":"%s","term":%s,"node_id":"%s"}' "$(is_sealed && echo true || echo false)" "$(cluster_leader)" "$(cluster_term)" "$STRONGBOX_NODE_ID" ;;
+    PUT\ /v1/secrets/*) secret_write "$token" "${path#/v1/secrets/}" "$body" ;;
+    GET\ /v1/secrets/*) version="$(printf '%s' "$query" | sed -n 's/^version=\([0-9][0-9]*\)$/\1/p')"; secret_read "$token" "${path#/v1/secrets/}" "$version" ;;
+    DELETE\ /v1/secrets/*) require_unsealed && auth_check "$token" "secret/${path#/v1/secrets/}" delete && storage_delete secrets "${path#/v1/secrets/}" && audit_append "$(token_hash "$token")" delete "secret/${path#/v1/secrets/}" 204 ;;
+    GET\ /v1/dynamic-postgres/*) require_unsealed && auth_check "$token" "dynamic-postgres/${path#/v1/dynamic-postgres/}" read && dynamic_pg_read "${path#/v1/dynamic-postgres/}" ;;
+    "POST /v1/auth/revoke") auth_check "$token" /v1/auth/revoke write || { printf '{"error":"forbidden"}'; return 1; }; token_revoke "$(json_field "$body" token)"; audit_append "$(token_hash "$token")" revoke /v1/auth/revoke 204 ;;
+    "POST /v1/auth/login") printf '{"token":"%s","policies":"%s"}' "$(user_login "$(json_field "$body" username)" "$(json_field "$body" password)")" "$(json_field "$body" username)" ;;
+    "GET /v1/auth/self") auth_check "$token" /v1/auth/self read || { printf '{"error":"unauthorized"}'; return 1; }; printf '{"token_id":"%s","policies":"%s","ttl":3600}' "$(token_hash "$token")" "$(token_policies "$token")" ;;
+    PUT\ /v1/policies/*) name="${path#/v1/policies/}"; auth_check "$token" "policy/${name}" write || { printf '{"error":"forbidden"}'; return 1; }; policy_put "$name" "$(json_field "$body" rules)"; printf '{"created":true}' ;;
+    GET\ /v1/policies/*) name="${path#/v1/policies/}"; auth_check "$token" "policy/${name}" read || { printf '{"error":"forbidden"}'; return 1; }; printf '{"rules":"%s"}' "$(policy_get "$name")" ;;
+    POST\ /v1/leases/*/renew) lease_id="${path#/v1/leases/}"; lease_id="${lease_id%/renew}"; auth_check "$token" "lease/${lease_id}" write || { printf '{"error":"forbidden"}'; return 1; }; lease_renew "$lease_id" ;;
+    POST\ /v1/leases/*/revoke) lease_id="${path#/v1/leases/}"; lease_id="${lease_id%/revoke}"; auth_check "$token" "lease/${lease_id}" write || { printf '{"error":"forbidden"}'; return 1; }; lease_revoke "$lease_id" ;;
+    "GET /v1/audit") auth_check "$token" /v1/audit read || { printf '{"error":"forbidden"}'; return 1; }; audit_query_json "$(printf '%s' "$query" | sed -n 's/^token=\(.*\)$/\1/p')" ;;
+    *) printf '{"error":"not found","path":"%s"}' "$raw_path"; return 1 ;;
+  esac
+}
