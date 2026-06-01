@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$ROOT/lib/http.sh"
+
+usage() {
+  cat <<'USAGE'
+strongbox serve [port]
+strongbox route METHOD PATH [BODY] [AUTH_HEADER]
+strongbox init
+strongbox reap
+USAGE
+}
+
+http_response() {
+  local status="$1" body="$2"
+  printf 'HTTP/1.1 %s\r\nContent-Type: application/json\r\nContent-Length: %s\r\nConnection: close\r\n\r\n%s' "$status" "${#body}" "$body"
+}
+
+serve_once() {
+  local request_line method path _ line auth="" len=0 body="" result status=200
+  IFS= read -r request_line || return 0
+  request_line="${request_line%$'\r'}"
+  read -r method path _ <<<"$request_line"
+  while IFS= read -r line; do
+    line="${line%$'\r'}"
+    [[ -z "$line" ]] && break
+    case "${line,,}" in
+      authorization:*) auth="${line#*: }" ;;
+      content-length:*) len="${line#*: }" ;;
+    esac
+  done
+  if [[ "$len" =~ ^[0-9]+$ && "$len" -gt 0 ]]; then
+    IFS= read -r -N "$len" body || true
+  fi
+  if result="$(route_request "$method" "$path" "$body" "$auth" 2>&1)"; then
+    case "$method $path" in
+      PUT*) status=201 ;;
+      DELETE*|POST\ /v1/sys/seal|POST\ /v1/auth/revoke) status=204 ;;
+      *) status=200 ;;
+    esac
+  else
+    if [[ -z "$result" ]]; then
+      result='{"error":"request failed"}'
+    fi
+    status=$([[ "$result" == *sealed* ]] && echo 503 || echo 403)
+  fi
+  http_response "$status" "$result"
+}
+
+serve() {
+  local port="${1:-8080}"
+  storage_init
+  seal_bootstrap
+  echo "strongbox ${STRONGBOX_NODE_ID} listening on ${port}" >&2
+  if command -v socat >/dev/null 2>&1; then
+    export ROOT STRONGBOX_NODE_ID STRONGBOX_DATA_DIR STRONGBOX_AUDIT_KEY
+    socat "TCP-LISTEN:${port},reuseaddr,fork" "EXEC:${BASH_SOURCE[0]} serve-once"
+  else
+    echo "socat is required for serve mode" >&2
+    return 127
+  fi
+}
+
+case "${1:-}" in
+  serve) shift; serve "$@" ;;
+  serve-once) serve_once ;;
+  route) shift; route_request "$@" ;;
+  init) route_request POST /v1/sys/init '{}' '' ;;
+  reap) dynamic_reap ;;
+  *) usage; exit 2 ;;
+esac
