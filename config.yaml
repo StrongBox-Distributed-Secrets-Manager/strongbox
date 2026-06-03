@@ -1,22 +1,13 @@
-node_id: "node1"
-listener:
-  port: 8200
-
-peers: []
-
-shamir:
-  k: 2
-  n: 3
-
-audit_log: "/var/log/strongbox/audit.log"
-
-db:
-  host: "postgres"
-  port: 5432
-  user: "postgres"
-  password: "postgrespassword"
-  dbname: "postgres"
-  roles:
-    readonly:
-      creation_statements: "CREATE ROLE %username% WITH LOGIN PASSWORD '%password%'; GRANT SELECT ON ALL TABLES IN SCHEMA public TO %username%;"
-      revocation_statements: "REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM %username%; DROP ROLE %username%;"
+cluster:
+  nodes: [node1, node2, node3]
+  election_timeout_ms: 1200
+  heartbeat_ms: 250
+seal:
+  shares: 3
+  threshold: 2
+leases:
+  default_ttl_seconds: 30
+  max_ttl_seconds: 300
+postgres:
+  dsn: "postgres://strongbox_admin:strongbox_admin@postgres:5432/postgres"
+  database: "postgres"

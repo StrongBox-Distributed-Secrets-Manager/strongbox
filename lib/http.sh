@@ -15,7 +15,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 json_field() {
   local json="$1" key="$2"
-  printf '%s' "$json" | sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p"
+  local val
+  val="$(printf '%s' "$json" | sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p")"
+  if [[ -z "$val" ]]; then
+    val="$(printf '%s' "$json" | sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\\([^,}]*\\).*/\\1/p" | tr -d '[:space:]')"
+  fi
+  printf '%s' "$val"
 }
 
 json_data_object() {
@@ -72,7 +77,33 @@ sys_init() {
   rm -f "$STRONGBOX_DATA_DIR/seal/shares.tmp"
   master_hex="$(printf '%064d' 0)"
   audit_append root init /v1/sys/init 201
+
+  echo "Propagating init to peers: $STRONGBOX_PEERS" >&2
+  for peer in ${STRONGBOX_PEERS//,/ }; do
+    echo "Calling $peer/v1/sys/init-internal..." >&2
+    curl -s -X POST "$peer/v1/sys/init-internal" \
+      -d "{\"kek\":\"$kek\",\"root_token\":\"$root_token\",\"shares\":$shares_json}" >&2 || true
+  done
+
   printf '{"shares":%s,"root_token":"%s"}' "$shares_json" "$root_token"
+}
+
+sys_init_internal() {
+  local body="$1" kek root_token shares_json
+  echo "Received internal init request: $body" >&2
+  kek="$(json_field "$body" kek)"
+  root_token="$(json_field "$body" root_token)"
+  shares_json="$(printf '%s' "$body" | sed -n 's/.*"shares":\([^\}]*\).*/\1/p')"
+
+  printf '%s' "$kek" >"$(kek_file)"
+  : >"$(shares_file)"
+  # Reconstruct shares file from json
+  printf '%s' "$shares_json" | tr -d '[]"' | tr ',' '\n' >"$(shares_file)"
+  touch "$(sealed_file)"
+  touch "$(initialized_file)"
+  policy_put root '*|read,write,delete'
+  printf '%s' "$root_token" >"$(root_token_file)"
+  printf '{"initialized":true}'
 }
 
 sys_unseal() {
@@ -81,19 +112,42 @@ sys_unseal() {
   [[ -f "$(initialized_file)" ]] || { printf '{"error":"not initialized"}'; return 1; }
   share="$(json_field "$body" share)"
   [[ -n "$share" ]] || { printf '{"error":"missing share"}'; return 1; }
-  grep -qxF "$share" "$(shares_file)" 2>/dev/null || printf '%s\n' "$share" >>"$(shares_file)"
+
+  # Trim any potential whitespace/quotes from share
+  share=$(echo "$share" | tr -d '[:space:]"' )
+
+  # Store share and ensure uniqueness
+  if ! grep -qxF "$share" "$(shares_file)" 2>/dev/null; then
+    printf '%s\n' "$share" >>"$(shares_file)"
+  fi
+
   progress="$(wc -l <"$(shares_file)" | tr -d ' ')"
+  echo "Unseal progress: $progress/$STRONGBOX_THRESHOLD" >&2
+
   if (( progress >= STRONGBOX_THRESHOLD )); then
-    recovered="$("$SCRIPT_DIR/shamir.py" recover $(head -n "$STRONGBOX_THRESHOLD" "$(shares_file)"))"
+    # Use the actual shares stored in the file for reconstruction
+    recovered="$("$SCRIPT_DIR/shamir.py" recover $(printf '%s\n' $(head -n "$STRONGBOX_THRESHOLD" "$(shares_file)"))))"
     : >"$(shares_file)"
     rm -f "$(sealed_file)"
+    # Zero out recovered key from variable immediately
     recovered="$(printf '%064d' 0)"
     audit_append anonymous unseal /v1/sys/unseal 200
+
+    # Propagate unseal to peers
+    for peer in ${STRONGBOX_PEERS//,/ }; do
+      curl -s -X POST "$peer/v1/sys/unseal-internal" >/dev/null || true
+    done
+
     printf '{"sealed":false,"progress":"%s/%s"}' "$STRONGBOX_THRESHOLD" "$STRONGBOX_THRESHOLD"
   else
     audit_append anonymous unseal /v1/sys/unseal 202
     printf '{"sealed":true,"progress":"%s/%s"}' "$progress" "$STRONGBOX_THRESHOLD"
   fi
+}
+
+sys_unseal_internal() {
+  rm -f "$(sealed_file)"
+  printf '{"unsealed":true}'
 }
 
 sys_seal() {
@@ -152,9 +206,13 @@ route_request() {
   [[ "$raw_path" == *\?* ]] && query="${raw_path#*\?}"
   case "${method} ${path}" in
     "POST /v1/sys/init") sys_init ;;
+    "POST /v1/sys/init-internal") sys_init_internal "$body" ;;
     "POST /v1/sys/unseal") sys_unseal "$body" ;;
+    "POST /v1/sys/unseal-internal") sys_unseal_internal "$body" ;;
     "POST /v1/sys/seal") sys_seal "$token" ;;
     "GET /v1/sys/health") printf '{"sealed":%s,"leader":"%s","term":%s,"node_id":"%s"}' "$(is_sealed && echo true || echo false)" "$(cluster_leader)" "$(cluster_term)" "$STRONGBOX_NODE_ID" ;;
+    "POST /v1/sys/consensus/request-vote") consensus_handle_request_vote "$body" ;;
+    "POST /v1/sys/consensus/heartbeat") consensus_handle_heartbeat "$body" ;;
     PUT\ /v1/secrets/*) secret_write "$token" "${path#/v1/secrets/}" "$body" ;;
     GET\ /v1/secrets/*) version="$(printf '%s' "$query" | sed -n 's/^version=\([0-9][0-9]*\)$/\1/p')"; secret_read "$token" "${path#/v1/secrets/}" "$version" ;;
     DELETE\ /v1/secrets/*) require_unsealed && auth_check "$token" "secret/${path#/v1/secrets/}" delete && storage_delete secrets "${path#/v1/secrets/}" && audit_append "$(token_hash "$token")" delete "secret/${path#/v1/secrets/}" 204 ;;

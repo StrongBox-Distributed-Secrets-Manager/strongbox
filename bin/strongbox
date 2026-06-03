@@ -34,7 +34,7 @@ serve_once() {
   if [[ "$len" =~ ^[0-9]+$ && "$len" -gt 0 ]]; then
     IFS= read -r -N "$len" body || true
   fi
-  if result="$(route_request "$method" "$path" "$body" "$auth" 2>&1)"; then
+  if result="$(route_request "$method" "$path" "$body" "$auth")"; then
     case "$method $path" in
       PUT*) status=201 ;;
       DELETE*|POST\ /v1/sys/seal|POST\ /v1/auth/revoke) status=204 ;;
@@ -54,11 +54,17 @@ serve() {
   storage_init
   seal_bootstrap
   echo "strongbox ${STRONGBOX_NODE_ID} listening on ${port}" >&2
+
+  # Start consensus loop in background
+  consensus_run "$port" &
+  CONSENSUS_PID=$!
+
   if command -v socat >/dev/null 2>&1; then
-    export ROOT STRONGBOX_NODE_ID STRONGBOX_DATA_DIR STRONGBOX_AUDIT_KEY
+    export ROOT STRONGBOX_NODE_ID STRONGBOX_DATA_DIR STRONGBOX_AUDIT_KEY STRONGBOX_PEERS
     socat "TCP-LISTEN:${port},reuseaddr,fork" "EXEC:${BASH_SOURCE[0]} serve-once"
   else
     echo "socat is required for serve mode" >&2
+    kill $CONSENSUS_PID 2>/dev/null || true
     return 127
   fi
 }
