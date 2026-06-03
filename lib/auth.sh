@@ -46,7 +46,7 @@ token_policies() {
 }
 
 auth_check() {
-  local token="$1" path="$2" cap="$3" rec status expires policies p rule_prefix rule_caps
+  local token="$1" path="$2" cap="$3" rec status expires policies p rule_prefix rule_caps match_prefix
   [[ -n "$token" ]] || return 1
   if [[ -f "$STRONGBOX_DATA_DIR/seal/root_token" ]] && [[ "$(cat "$STRONGBOX_DATA_DIR/seal/root_token")" == "$token" ]]; then
     return 0
@@ -59,8 +59,8 @@ auth_check() {
   for policy in "${p[@]}"; do
     while IFS='|' read -r rule_prefix rule_caps; do
       [[ -z "$rule_prefix" ]] && continue
-      local match_prefix="${rule_prefix%/\*}"
-      if [[ "$rule_prefix" == "*" || "$path" == "$match_prefix" || "$path" == "$match_prefix/"* || "$path" == "$rule_prefix" ]] && [[ ",$rule_caps," == *",$cap,"* ]]; then
+      match_prefix="${rule_prefix%\*}"
+      if [[ "$rule_prefix" == "*" || "$path" == "$match_prefix"* ]] && [[ ",$rule_caps," == *",$cap,"* ]]; then
         return 0
       fi
     done < <(policy_get "$policy" 2>/dev/null || true)
@@ -69,18 +69,19 @@ auth_check() {
 }
 
 user_put() {
-  local username="$1" password="$2" policies="$3" hash
-  hash="$(printf '%s' "$password" | openssl passwd -6 -stdin)"
-  printf '%s|%s\n' "$hash" "$policies" | storage_put users "$username"
+  local username="$1" password="$2" policies="$3" salt hash
+  salt="$(random_b64 16)"
+  hash="$(printf '%s' "$password" | argon2 "$salt" -id -e)"
+  printf '%s|%s|%s\n' "$hash" "$salt" "$policies" | storage_put users "$username"
 }
 
 user_login() {
-  local username="$1" password="$2" rec hash policies
+  local username="$1" password="$2" rec hash salt policies current_hash
   rec="$(storage_get users "$username")"
-  hash="${rec%%|*}"
-  policies="${rec#*|}"
-  printf '%s' "$password" | openssl passwd -6 -stdin -salt "$(printf '%s' "$hash" | awk -F'$' '{print $3}')" >/dev/null
-  if openssl passwd -6 -stdin -salt "$(printf '%s' "$hash" | awk -F'$' '{print $3}')" <<<"$password" | grep -qxF "$hash"; then
+  [[ -n "$rec" ]] || return 1
+  IFS='|' read -r hash salt policies <<<"$rec"
+  current_hash="$(printf '%s' "$password" | argon2 "$salt" -id -e)"
+  if [[ "$current_hash" == "$hash" ]]; then
     token_create "$policies" 3600
   else
     return 1
