@@ -101,5 +101,4 @@ Every encryption operation generates a fresh random IV with OpenSSL. The encrypt
 - [memory clean](screenshots/memory-clean.png)
 
 ## GitHub
-
-Set before submission: `https://github.com/StrongBox-Distributed-Secrets-Manager/strongbox`
+`https://github.com/StrongBox-Distributed-Secrets-Manager/strongbox`
